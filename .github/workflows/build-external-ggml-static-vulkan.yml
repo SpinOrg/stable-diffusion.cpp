@@ -1,0 +1,491 @@
+name: Build static Vulkan SDK with external GGML
+
+on:
+  workflow_call:
+    inputs:
+      target_os:
+        description: Platforms to build
+        required: false
+        default: all
+        type: string
+      external_ggml_repository:
+        description: GitHub repository containing compatible static GGML release assets
+        required: true
+        type: string
+      external_ggml_release_tag:
+        description: External GGML release tag; empty selects latest
+        required: false
+        default: ""
+        type: string
+      linux_asset_pattern:
+        description: Regular expression matching the Linux x64 SDK asset
+        required: false
+        default: "bin-ubuntu-vulkan-x64[.]zip$"
+        type: string
+      windows_asset_pattern:
+        description: Regular expression matching the Windows x64 SDK asset
+        required: false
+        default: "bin-win-vulkan-x64[.]zip$"
+        type: string
+      macos_asset_pattern:
+        description: Regular expression matching a macOS SDK asset; {arch} is replaced by the matrix architecture
+        required: false
+        default: "bin-darwin-vulkan-{arch}[.]zip$"
+        type: string
+    secrets:
+      EXTERNAL_GGML_TOKEN:
+        description: Optional token for an external GGML repository not readable with github.token
+        required: false
+  workflow_dispatch:
+    inputs:
+      target_os:
+        description: Platforms to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+          - macos
+      external_ggml_repository:
+        description: GitHub repository containing compatible static GGML release assets
+        required: true
+        type: string
+      external_ggml_release_tag:
+        description: External GGML release tag; empty selects latest
+        required: false
+        default: ""
+        type: string
+      linux_asset_pattern:
+        description: Regular expression matching the Linux x64 SDK asset
+        required: false
+        default: "bin-ubuntu-vulkan-x64[.]zip$"
+        type: string
+      windows_asset_pattern:
+        description: Regular expression matching the Windows x64 SDK asset
+        required: false
+        default: "bin-win-vulkan-x64[.]zip$"
+        type: string
+      macos_asset_pattern:
+        description: Regular expression matching a macOS SDK asset; {arch} is replaced by the matrix architecture
+        required: false
+        default: "bin-darwin-vulkan-{arch}[.]zip$"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.target_os }}-${{ inputs.external_ggml_release_tag }}
+  cancel-in-progress: true
+
+env:
+  EXTERNAL_GGML_REPOSITORY: ${{ inputs.external_ggml_repository }}
+  VULKAN_VERSION: 1.4.313.2
+
+jobs:
+  linux-x64:
+    if: ${{ inputs.target_os == 'all' || inputs.target_os == 'linux' }}
+    runs-on: [self-hosted, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential jq libvulkan-dev ninja-build unzip
+
+      - name: Download matching external GGML SDK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.EXTERNAL_GGML_TOKEN || github.token }}
+          REQUESTED_TAG: ${{ inputs.external_ggml_release_tag }}
+          ASSET_PATTERN: ${{ inputs.linux_asset_pattern }}
+        run: |
+          set -euo pipefail
+
+          endpoint="repos/${EXTERNAL_GGML_REPOSITORY}/releases/latest"
+          if [ -n "$REQUESTED_TAG" ]; then
+            endpoint="repos/${EXTERNAL_GGML_REPOSITORY}/releases/tags/${REQUESTED_TAG}"
+          fi
+          release_json="$(gh api "$endpoint")"
+          asset_name="$(jq -r --arg pattern "$ASSET_PATTERN" '[.assets[] | select(.name | test($pattern))][0].name // empty' <<<"$release_json")"
+          asset_url="$(jq -r --arg pattern "$ASSET_PATTERN" '[.assets[] | select(.name | test($pattern))][0].url // empty' <<<"$release_json")"
+          if [ -z "$asset_url" ]; then
+            echo "No Ubuntu Vulkan x64 asset found in ${endpoint}. Available assets:" >&2
+            jq -r '.assets[]?.name' <<<"$release_json" >&2
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/external-ggml-sdk"
+          gh api -H "Accept: application/octet-stream" "$asset_url" > "$RUNNER_TEMP/external-ggml-sdk.zip"
+          unzip -q "$RUNNER_TEMP/external-ggml-sdk.zip" -d "$RUNNER_TEMP/external-ggml-sdk"
+          external_ggml_tag="$(jq -r .tag_name <<<"$release_json")"
+          mkdir -p "$RUNNER_TEMP/external-ggml-source"
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${EXTERNAL_GGML_REPOSITORY}/tarball/${external_ggml_tag}" > "$RUNNER_TEMP/external-ggml-source.tar.gz"
+          tar -C "$RUNNER_TEMP/external-ggml-source" -xzf "$RUNNER_TEMP/external-ggml-source.tar.gz" --strip-components=1
+
+          mapfile -t configs < <(find "$RUNNER_TEMP/external-ggml-sdk" -type f -path '*/lib/cmake/ggml/ggml-config.cmake')
+          if [ "${#configs[@]}" -ne 1 ]; then
+            printf 'Expected one ggml-config.cmake, found %s\n' "${#configs[@]}" >&2
+            printf '%s\n' "${configs[@]:-}" >&2
+            exit 1
+          fi
+
+          echo "GGML_DIR=$(dirname "${configs[0]}")" >> "$GITHUB_ENV"
+          echo "EXTERNAL_GGML_SOURCE=$RUNNER_TEMP/external-ggml-source/ggml" >> "$GITHUB_ENV"
+          echo "EXTERNAL_GGML_RELEASE_TAG=$(jq -r .tag_name <<<"$release_json")" >> "$GITHUB_ENV"
+          echo "EXTERNAL_GGML_ASSET_NAME=$asset_name" >> "$GITHUB_ENV"
+
+      - name: Configure and build diffusion-only archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-external-ggml -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/package" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DSD_BUILD_EXAMPLES=OFF \
+            -DSD_BUILD_SHARED_LIBS=OFF \
+            -DSD_BUILD_SHARED_GGML_LIB=OFF \
+            -DSD_USE_SYSTEM_GGML=ON \
+            -DSD_USE_UPSTREAM_GGML=ON \
+            -DSD_GGML_SOURCE_DIR="$EXTERNAL_GGML_SOURCE" \
+            -DSD_VULKAN=ON \
+            -DSD_WEBP=OFF \
+            -DSD_WEBM=OFF \
+            -Dggml_DIR="$GGML_DIR"
+          cmake --build build-external-ggml --config Release --target stable-diffusion --parallel
+          cmake --install build-external-ggml --config Release
+
+      - name: Validate and package SDK
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable_sha="$(git rev-parse HEAD)"
+          short_sha="${stable_sha:0:7}"
+          asset="stable-diffusion-external-ggml-${short_sha}-ubuntu-vulkan-x64.tar.gz"
+
+          test -f package/include/stable-diffusion.h
+          test -f package/lib/libstable-diffusion.a
+          test -f package/lib/cmake/stable-diffusion/stable-diffusion-config.cmake
+          mkdir -p package/thirdparty package/share/stable-diffusion-external-ggml
+          cp thirdparty/stb_image_write.h package/thirdparty/
+          cp LICENSE package/
+
+          if find package/lib -maxdepth 1 -type f -iname '*ggml*' | grep . >/dev/null; then
+            echo "The diffusion SDK must not contain GGML libraries." >&2
+            find package/lib -maxdepth 1 -type f -iname '*ggml*' >&2
+            exit 1
+          fi
+          nm -u package/lib/libstable-diffusion.a | grep 'ggml_' >/dev/null
+
+          jq -n \
+            --arg stable_diffusion_commit "$stable_sha" \
+            --arg external_ggml_repository "$EXTERNAL_GGML_REPOSITORY" \
+            --arg external_ggml_release_tag "$EXTERNAL_GGML_RELEASE_TAG" \
+            --arg external_ggml_asset "$EXTERNAL_GGML_ASSET_NAME" \
+            --arg platform "ubuntu-vulkan-x64" \
+            '{schema_version: 1, stable_diffusion_commit: $stable_diffusion_commit, external_ggml_repository: $external_ggml_repository, external_ggml_release_tag: $external_ggml_release_tag, external_ggml_asset: $external_ggml_asset, platform: $platform, linkage: "static-diffusion-external-static-ggml"}' \
+            > package/share/stable-diffusion-external-ggml/manifest.json
+
+          tar -C package -czf "$asset" .
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-diffusion-external-ggml-ubuntu-vulkan-x64
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-x64:
+    if: ${{ inputs.target_os == 'all' || inputs.target_os == 'windows' }}
+    runs-on: [self-hosted, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Setup Vulkan SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vulkanPath = "C:\VulkanSDK\${env:VULKAN_VERSION}"
+          if (-not (Test-Path "$vulkanPath\Lib\vulkan-1.lib")) {
+            throw "Vulkan SDK ${env:VULKAN_VERSION} is not installed at $vulkanPath"
+          }
+          "VULKAN_SDK=$vulkanPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vulkanPath\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download matching external GGML SDK
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.EXTERNAL_GGML_TOKEN || github.token }}
+          REQUESTED_TAG: ${{ inputs.external_ggml_release_tag }}
+          ASSET_PATTERN: ${{ inputs.windows_asset_pattern }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $endpoint = "repos/$env:EXTERNAL_GGML_REPOSITORY/releases/latest"
+          if ($env:REQUESTED_TAG) {
+            $endpoint = "repos/$env:EXTERNAL_GGML_REPOSITORY/releases/tags/$env:REQUESTED_TAG"
+          }
+          $release = gh api $endpoint | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not query $endpoint" }
+          $asset = @($release.assets | Where-Object { $_.name -match $env:ASSET_PATTERN }) | Select-Object -First 1
+          if (-not $asset) {
+            $names = ($release.assets | ForEach-Object { $_.name }) -join "`n"
+            throw "No Windows Vulkan x64 asset found in $endpoint. Available assets:`n$names"
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP "external-ggml-sdk.zip"
+          $sdkRoot = Join-Path $env:RUNNER_TEMP "external-ggml-sdk"
+          Invoke-WebRequest -Uri $asset.browser_download_url -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -OutFile $archive
+          New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
+          Expand-Archive -Path $archive -DestinationPath $sdkRoot -Force
+
+          $sourceArchive = Join-Path $env:RUNNER_TEMP "external-ggml-source.zip"
+          $sourceExtract = Join-Path $env:RUNNER_TEMP "external-ggml-source"
+          $escapedTag = [Uri]::EscapeDataString([string]$release.tag_name)
+          $sourceUrl = "https://api.github.com/repos/$env:EXTERNAL_GGML_REPOSITORY/zipball/$escapedTag"
+          Invoke-WebRequest -Uri $sourceUrl -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -OutFile $sourceArchive
+          New-Item -ItemType Directory -Force -Path $sourceExtract | Out-Null
+          Expand-Archive -Path $sourceArchive -DestinationPath $sourceExtract -Force
+          $sourceRoots = @(Get-ChildItem -Path $sourceExtract -Directory)
+          if ($sourceRoots.Count -ne 1 -or -not (Test-Path "$($sourceRoots[0].FullName)\ggml\src\ggml-impl.h")) {
+            throw "The external source archive does not contain one matching GGML source tree."
+          }
+          $externalGgmlSource = Join-Path $sourceRoots[0].FullName "ggml"
+
+          $configs = @(Get-ChildItem -Path $sdkRoot -Recurse -Filter ggml-config.cmake | Where-Object { $_.FullName -match '[\\/]lib[\\/]cmake[\\/]ggml[\\/]ggml-config[.]cmake$' })
+          if ($configs.Count -ne 1) {
+            throw "Expected one ggml-config.cmake, found $($configs.Count)"
+          }
+          "GGML_DIR=$($configs[0].Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXTERNAL_GGML_SOURCE=$externalGgmlSource" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXTERNAL_GGML_RELEASE_TAG=$($release.tag_name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXTERNAL_GGML_ASSET_NAME=$($asset.name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure and build diffusion-only archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio C++ tools not found" }
+          & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+
+          cmake -S . -B build-external-ggml -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\package" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON `
+            -DSD_BUILD_EXAMPLES=OFF `
+            -DSD_BUILD_SHARED_LIBS=OFF `
+            -DSD_BUILD_SHARED_GGML_LIB=OFF `
+            -DSD_USE_SYSTEM_GGML=ON `
+            -DSD_USE_UPSTREAM_GGML=ON `
+            -DSD_GGML_SOURCE_DIR="$env:EXTERNAL_GGML_SOURCE" `
+            -DSD_VULKAN=ON `
+            -DSD_WEBP=OFF `
+            -DSD_WEBM=OFF `
+            -Dggml_DIR="$env:GGML_DIR"
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+          cmake --build build-external-ggml --config Release --target stable-diffusion --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+          cmake --install build-external-ggml --config Release
+          if ($LASTEXITCODE -ne 0) { throw "Install failed" }
+
+      - name: Validate and package SDK
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stableSha = (git rev-parse HEAD).Trim()
+          $shortSha = $stableSha.Substring(0, 7)
+          $asset = "stable-diffusion-external-ggml-$shortSha-win-vulkan-x64.zip"
+          $package = Join-Path $env:GITHUB_WORKSPACE "package"
+
+          if (-not (Test-Path "$package\include\stable-diffusion.h")) { throw "Missing stable-diffusion.h" }
+          if (-not (Test-Path "$package\lib\stable-diffusion.lib")) { throw "Missing stable-diffusion.lib" }
+          if (Get-ChildItem "$package\lib" -File | Where-Object { $_.Name -match 'ggml' }) {
+            throw "The diffusion SDK must not contain GGML libraries."
+          }
+
+          New-Item -ItemType Directory -Force -Path "$package\thirdparty" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$package\share\stable-diffusion-external-ggml" | Out-Null
+          Copy-Item thirdparty\stb_image_write.h "$package\thirdparty\"
+          Copy-Item LICENSE "$package\"
+          $manifest = [ordered]@{
+            schema_version = 1
+            stable_diffusion_commit = $stableSha
+            external_ggml_repository = $env:EXTERNAL_GGML_REPOSITORY
+            external_ggml_release_tag = $env:EXTERNAL_GGML_RELEASE_TAG
+            external_ggml_asset = $env:EXTERNAL_GGML_ASSET_NAME
+            platform = "win-vulkan-x64"
+            linkage = "static-diffusion-external-static-ggml"
+          } | ConvertTo-Json
+          Set-Content -Path "$package\share\stable-diffusion-external-ggml\manifest.json" -Value $manifest -Encoding utf8
+
+          Compress-Archive -Path "$package\*" -DestinationPath $asset -CompressionLevel Optimal -Force
+          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload Windows SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-diffusion-external-ggml-win-vulkan-x64
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    if: ${{ inputs.target_os == 'all' || inputs.target_os == 'macos' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install Vulkan dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake ninja jq vulkan-headers vulkan-loader molten-vk
+          echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix vulkan-loader);$(brew --prefix vulkan-headers);$(brew --prefix molten-vk)" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
+
+      - name: Download matching external GGML SDK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.EXTERNAL_GGML_TOKEN || github.token }}
+          REQUESTED_TAG: ${{ inputs.external_ggml_release_tag }}
+          ASSET_PATTERN: ${{ inputs.macos_asset_pattern }}
+        run: |
+          set -euo pipefail
+          endpoint="repos/${EXTERNAL_GGML_REPOSITORY}/releases/latest"
+          if [ -n "$REQUESTED_TAG" ]; then
+            endpoint="repos/${EXTERNAL_GGML_REPOSITORY}/releases/tags/${REQUESTED_TAG}"
+          fi
+          release_json="$(gh api "$endpoint")"
+          pattern="$ASSET_PATTERN"
+          pattern="${pattern//\{arch\}/${{ matrix.arch }}}"
+          asset_name="$(jq -r --arg pattern "$pattern" '[.assets[] | select(.name | test($pattern))][0].name // empty' <<<"$release_json")"
+          asset_url="$(jq -r --arg pattern "$pattern" '[.assets[] | select(.name | test($pattern))][0].url // empty' <<<"$release_json")"
+          if [ -z "$asset_url" ]; then
+            echo "No macOS Vulkan ${{ matrix.arch }} asset found in ${endpoint}. Available assets:" >&2
+            jq -r '.assets[]?.name' <<<"$release_json" >&2
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/external-ggml-sdk"
+          gh api -H "Accept: application/octet-stream" "$asset_url" > "$RUNNER_TEMP/external-ggml-sdk.zip"
+          unzip -q "$RUNNER_TEMP/external-ggml-sdk.zip" -d "$RUNNER_TEMP/external-ggml-sdk"
+          external_ggml_tag="$(jq -r .tag_name <<<"$release_json")"
+          mkdir -p "$RUNNER_TEMP/external-ggml-source"
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${EXTERNAL_GGML_REPOSITORY}/tarball/${external_ggml_tag}" > "$RUNNER_TEMP/external-ggml-source.tar.gz"
+          tar -C "$RUNNER_TEMP/external-ggml-source" -xzf "$RUNNER_TEMP/external-ggml-source.tar.gz" --strip-components=1
+          ggml_config="$(find "$RUNNER_TEMP/external-ggml-sdk" -type f -path '*/lib/cmake/ggml/ggml-config.cmake' -print -quit)"
+          second_config="$(find "$RUNNER_TEMP/external-ggml-sdk" -type f -path '*/lib/cmake/ggml/ggml-config.cmake' -print | sed -n '2p')"
+          if [ -z "$ggml_config" ] || [ -n "$second_config" ]; then
+            echo "Expected exactly one ggml-config.cmake." >&2
+            find "$RUNNER_TEMP/external-ggml-sdk" -name ggml-config.cmake -print >&2
+            exit 1
+          fi
+          echo "GGML_DIR=$(dirname "$ggml_config")" >> "$GITHUB_ENV"
+          echo "EXTERNAL_GGML_SOURCE=$RUNNER_TEMP/external-ggml-source/ggml" >> "$GITHUB_ENV"
+          echo "EXTERNAL_GGML_RELEASE_TAG=$(jq -r .tag_name <<<"$release_json")" >> "$GITHUB_ENV"
+          echo "EXTERNAL_GGML_ASSET_NAME=$asset_name" >> "$GITHUB_ENV"
+
+      - name: Configure and build diffusion-only archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-external-ggml -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/package" \
+            -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DSD_BUILD_EXAMPLES=OFF \
+            -DSD_BUILD_SHARED_LIBS=OFF \
+            -DSD_BUILD_SHARED_GGML_LIB=OFF \
+            -DSD_USE_SYSTEM_GGML=ON \
+            -DSD_USE_UPSTREAM_GGML=ON \
+            -DSD_GGML_SOURCE_DIR="$EXTERNAL_GGML_SOURCE" \
+            -DSD_VULKAN=ON \
+            -DSD_WEBP=OFF \
+            -DSD_WEBM=OFF \
+            -Dggml_DIR="$GGML_DIR"
+          cmake --build build-external-ggml --config Release --target stable-diffusion --parallel
+          cmake --install build-external-ggml --config Release
+
+      - name: Validate and package SDK
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable_sha="$(git rev-parse HEAD)"
+          short_sha="${stable_sha:0:7}"
+          asset="stable-diffusion-external-ggml-${short_sha}-darwin-vulkan-${{ matrix.arch }}.tar.gz"
+
+          test -f package/include/stable-diffusion.h
+          test -f package/lib/libstable-diffusion.a
+          test -f package/lib/cmake/stable-diffusion/stable-diffusion-config.cmake
+          mkdir -p package/thirdparty package/share/stable-diffusion-external-ggml
+          cp thirdparty/stb_image_write.h package/thirdparty/
+          cp LICENSE package/
+          if find package/lib -maxdepth 1 -type f -iname '*ggml*' | grep . >/dev/null; then
+            echo "The diffusion SDK must not contain GGML libraries." >&2
+            exit 1
+          fi
+          nm -u package/lib/libstable-diffusion.a | grep 'ggml_' >/dev/null
+
+          jq -n \
+            --arg stable_diffusion_commit "$stable_sha" \
+            --arg external_ggml_release_tag "$EXTERNAL_GGML_RELEASE_TAG" \
+            --arg external_ggml_repository "$EXTERNAL_GGML_REPOSITORY" \
+            --arg external_ggml_asset "$EXTERNAL_GGML_ASSET_NAME" \
+            --arg platform "darwin-vulkan-${{ matrix.arch }}" \
+            '{schema_version: 1, stable_diffusion_commit: $stable_diffusion_commit, external_ggml_repository: $external_ggml_repository, external_ggml_release_tag: $external_ggml_release_tag, external_ggml_asset: $external_ggml_asset, platform: $platform, linkage: "static-diffusion-external-static-ggml"}' \
+            > package/share/stable-diffusion-external-ggml/manifest.json
+
+          tar -C package -czf "$asset" .
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload macOS SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-diffusion-external-ggml-darwin-vulkan-${{ matrix.arch }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7

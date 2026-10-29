@@ -32,7 +32,7 @@ cmake -S . -B build-upstream -DSD_USE_UPSTREAM_GGML=ON -DSD_GGML_SOURCE_DIR=../g
 cmake --build build-upstream --config Release
 ```
 
-The selected source tree supplies both the library and its private headers.
+The selected source tree supplies both the library and its internal source headers.
 Backend options such as `-DSD_CUDA=ON` apply to the selected tree as usual.
 
 `SD_USE_UPSTREAM_GGML` defaults to `OFF`, which enables the patched GGML
@@ -51,7 +51,7 @@ quantization types remain available, subject to backend operator support.
 
 `SD_USE_SYSTEM_GGML=ON` instead links an installed GGML CMake package, located
 with `ggml_DIR` or `CMAKE_PREFIX_PATH`. In that mode, `SD_GGML_SOURCE_DIR` must
-point to the matching source tree for private headers. The installed library
+point to the matching source tree for internal headers. The installed library
 must use the same ABI settings as sd.cpp, including `GGML_MAX_NAME`.
 Set `SD_USE_UPSTREAM_GGML=ON` as well if the installed package is upstream GGML.
 
@@ -177,6 +177,42 @@ mkdir build && cd build
 cmake .. -DSD_VULKAN=ON
 cmake --build . --config Release
 ```
+
+### Static Vulkan SDK for an external GGML host
+
+Applications that already provide GGML and its Vulkan backend can build a
+diffusion-only static archive. The GGML package and its internal source headers
+must come from the same provider revision:
+
+```shell
+cmake -S . -B build-host -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$PWD/package" \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DSD_BUILD_EXAMPLES=OFF \
+  -DSD_BUILD_SHARED_LIBS=OFF \
+  -DSD_BUILD_SHARED_GGML_LIB=OFF \
+  -DSD_USE_SYSTEM_GGML=ON \
+  -DSD_USE_UPSTREAM_GGML=ON \
+  -DSD_GGML_SOURCE_DIR=/path/to/matching/provider/ggml \
+  -DSD_VULKAN=ON \
+  -DSD_WEBP=OFF \
+  -DSD_WEBM=OFF \
+  -Dggml_DIR=/path/to/matching/external-ggml-sdk/lib/cmake/ggml
+cmake --build build-host --target stable-diffusion --parallel
+cmake --install build-host
+```
+
+The installed archive intentionally leaves GGML symbols unresolved. Link it
+before the host's matching `ggml`, `ggml-vulkan`, `ggml-cpu`, and `ggml-base`
+static libraries and the platform Vulkan loader.
+
+The `Build static Vulkan SDK with external GGML` workflow builds this layout for
+Linux x64, Windows x64, and macOS arm64/x86_64. Its inputs select a provider
+repository, release, and per-platform asset patterns. The workflow downloads the
+static SDK and matching source snapshot so the GGML headers match the libraries.
+The release workflow publishes the platform archives and checksums; each archive
+includes a manifest identifying both source revisions and the selected SDK asset.
 
 ## Build with OpenCL (for Adreno GPU)
 

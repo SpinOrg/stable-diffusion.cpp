@@ -1,0 +1,134 @@
+name: Release static Vulkan SDK with external GGML
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_os:
+        description: Platforms to build and release
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+          - macos
+      external_ggml_repository:
+        description: GitHub repository containing compatible static GGML release assets
+        required: true
+        type: string
+      external_ggml_release_tag:
+        description: External GGML release tag; empty selects latest
+        required: false
+        default: ""
+        type: string
+      linux_asset_pattern:
+        description: Regular expression matching the Linux x64 SDK asset
+        required: false
+        default: "bin-ubuntu-vulkan-x64[.]zip$"
+        type: string
+      windows_asset_pattern:
+        description: Regular expression matching the Windows x64 SDK asset
+        required: false
+        default: "bin-win-vulkan-x64[.]zip$"
+        type: string
+      macos_asset_pattern:
+        description: Regular expression matching a macOS SDK asset; {arch} is replaced by the matrix architecture
+        required: false
+        default: "bin-darwin-vulkan-{arch}[.]zip$"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-external-ggml-static-vulkan.yml
+    with:
+      target_os: ${{ inputs.target_os }}
+      external_ggml_repository: ${{ inputs.external_ggml_repository }}
+      external_ggml_release_tag: ${{ inputs.external_ggml_release_tag }}
+      linux_asset_pattern: ${{ inputs.linux_asset_pattern }}
+      windows_asset_pattern: ${{ inputs.windows_asset_pattern }}
+      macos_asset_pattern: ${{ inputs.macos_asset_pattern }}
+    secrets: inherit
+
+  release:
+    needs: build
+    runs-on: [self-hosted, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download SDK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: stable-diffusion-external-ggml-*
+          merge-multiple: true
+
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          safe_branch="$(printf '%s' "$branch" | tr '/' '-')"
+          count="$(git rev-list --count HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          echo "name=${safe_branch}-${count}-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(artifacts/*.zip artifacts/*.tar.gz)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No static Vulkan SDK artifacts were downloaded." >&2
+            exit 1
+          fi
+          printf '%s  %s\n' \
+            "$(sha256sum "${assets[0]}" | awk '{print $1}')" \
+            "$(basename "${assets[0]}")" > artifacts/SHA256SUMS
+          for asset in "${assets[@]:1}"; do
+            printf '%s  %s\n' \
+              "$(sha256sum "$asset" | awk '{print $1}')" \
+              "$(basename "$asset")" >> artifacts/SHA256SUMS
+          done
+          cat artifacts/SHA256SUMS
+
+      - name: Create or reuse release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Reusing release $RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --notes "Static stable-diffusion SDKs built against an external GGML package. The matching provider repository, release, and asset are recorded in each archive manifest."
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload or replace release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(artifacts/*.zip artifacts/*.tar.gz artifacts/SHA256SUMS)
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber

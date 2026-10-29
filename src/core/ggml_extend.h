@@ -9,7 +9,17 @@
 
 #define EPS 1e-05f
 
+#ifndef SD_USE_UPSTREAM_GGML
 static_assert(GGML_MAX_NAME >= 160, "GGML_MAX_NAME must be at least 160");
+#endif
+
+inline void sd_ggml_prec_set_acc(ggml_tensor* tensor) {
+#ifndef SD_USE_UPSTREAM_GGML
+    ggml_prec_set_acc(tensor, GGML_PREC_F32);
+#else
+    (void) tensor;
+#endif
+}
 
 // n-mode tensor-matrix product
 // example: 2-mode product
