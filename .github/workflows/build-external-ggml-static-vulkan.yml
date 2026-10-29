@@ -258,7 +258,23 @@ jobs:
 
           $archive = Join-Path $env:RUNNER_TEMP "external-ggml-sdk.zip"
           $sdkRoot = Join-Path $env:RUNNER_TEMP "external-ggml-sdk"
-          Invoke-WebRequest -Uri $asset.browser_download_url -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -OutFile $archive
+          $downloadRoot = Join-Path $env:RUNNER_TEMP "external-ggml-download"
+          $releaseTag = [string]$release.tag_name
+          $assetName = [string]$asset.name
+          New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
+          & gh release download $releaseTag `
+            --repo $env:EXTERNAL_GGML_REPOSITORY `
+            --pattern $assetName `
+            --dir $downloadRoot `
+            --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download release asset '$assetName' from $env:EXTERNAL_GGML_REPOSITORY at tag '$releaseTag'."
+          }
+          $downloadedAsset = Join-Path $downloadRoot $assetName
+          if (-not (Test-Path $downloadedAsset)) {
+            throw "GitHub CLI completed without creating the expected asset: $downloadedAsset"
+          }
+          Move-Item -Path $downloadedAsset -Destination $archive -Force
           New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
           Expand-Archive -Path $archive -DestinationPath $sdkRoot -Force
 
