@@ -73,6 +73,59 @@ jobs:
           pattern: stable-diffusion-external-ggml-*
           merge-multiple: true
 
+      - name: Carry forward unchanged Linux and macOS assets
+        if: inputs.target_os == 'windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest")"
+          previous_tag="$(jq -r '.tag_name' <<<"$release_json")"
+          mapfile -t assets < <(
+            jq -r '
+              .assets[]
+              | select(.name | test("^stable-diffusion-external-ggml-[0-9a-f]+-(ubuntu-vulkan-x64|darwin-vulkan-(x86_64|arm64))[.]tar[.]gz$"))
+              | .name
+            ' <<<"$release_json"
+          )
+          if [ "${#assets[@]}" -ne 3 ]; then
+            echo "Expected three unchanged Linux/macOS SDK assets in release '$previous_tag'. Available assets:" >&2
+            jq -r '.assets[]?.name' <<<"$release_json" >&2
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            echo "Carrying forward $asset from release $previous_tag"
+            gh release download "$previous_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" \
+              --dir artifacts \
+              --clobber
+          done
+
+      - name: Validate Windows-only release payload
+        if: inputs.target_os == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          windows=(artifacts/*-win-vulkan-x64.zip)
+          linux=(artifacts/*-ubuntu-vulkan-x64.tar.gz)
+          macos_x86_64=(artifacts/*-darwin-vulkan-x86_64.tar.gz)
+          macos_arm64=(artifacts/*-darwin-vulkan-arm64.tar.gz)
+          if [ "${#windows[@]}" -ne 1 ] \
+              || [ "${#linux[@]}" -ne 1 ] \
+              || [ "${#macos_x86_64[@]}" -ne 1 ] \
+              || [ "${#macos_arm64[@]}" -ne 1 ]; then
+            echo "The Windows-only release payload must contain one asset for every supported platform." >&2
+            find artifacts -maxdepth 1 -type f -printf '%f\n' | sort >&2
+            exit 1
+          fi
+          unzip -tq "${windows[0]}"
+          tar -tzf "${linux[0]}" >/dev/null
+          tar -tzf "${macos_x86_64[0]}" >/dev/null
+          tar -tzf "${macos_arm64[0]}" >/dev/null
+
       - name: Determine release tag
         id: tag
         shell: bash
