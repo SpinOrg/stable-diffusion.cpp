@@ -312,6 +312,7 @@ jobs:
           cmake -S . -B build-external-ggml -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE\package" `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON `
             -DSD_BUILD_EXAMPLES=OFF `
@@ -329,6 +330,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Build failed" }
           cmake --install build-external-ggml --config Release
           if ($LASTEXITCODE -ne 0) { throw "Install failed" }
+
+          $stableDiffusionLibrary = Join-Path $env:GITHUB_WORKSPACE "package\lib\stable-diffusion.lib"
+          if (-not (Test-Path $stableDiffusionLibrary)) {
+            throw "Stable Diffusion archive was not installed: $stableDiffusionLibrary"
+          }
+          $directives = @(& dumpbin.exe /nologo /directives $stableDiffusionLibrary 2>&1)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect MSVC runtime directives in $stableDiffusionLibrary"
+          }
+          $dynamicRuntime = @($directives | Select-String 'RuntimeLibrary=MD_Dynamic')
+          if ($dynamicRuntime.Count -gt 0) {
+            throw "stable-diffusion.lib contains /MD objects; the external GGML SDK uses /MT. Ensure CMP0091 is NEW before project() and rebuild."
+          }
+          $staticRuntime = @($directives | Select-String 'RuntimeLibrary=MT_StaticRelease')
+          if ($staticRuntime.Count -eq 0) {
+            throw "stable-diffusion.lib does not contain the expected /MT release runtime directive."
+          }
+          Write-Host "Validated stable-diffusion.lib MSVC runtime: /MT"
 
       - name: Validate and package SDK
         id: package
